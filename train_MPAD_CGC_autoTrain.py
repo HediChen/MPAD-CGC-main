@@ -1,11 +1,7 @@
 '''
-这是MPAD-CGC模型的训练脚本，包含多任务学习功能。
-功能概述:
-    该脚本实现了一个多任务学习框架，使用MPAD-CGC模型对时间序列数据进行训练。
-    通过交叉验证评估模型性能，并保存每个折的训练结果和模型参数。
-    训练过程中记录各任务的损失和准确率，并绘制相应的曲线图。
-    最终输出每个任务在验证集上的预测结果，便于后续分析和评估。
-    需要指定模型的共享专家和任务专家数量等超参数。
+这是MPAD-CGC模型的自动训练主脚本，包含自动化的超参数搜索功能，
+通过交叉验证评估不同的专家配置组合（共享专家和任务专家数量），
+并保存每个配置的训练结果和模型参数，便于后续使用para_config.py脚本进行分析和选择最佳配置。
 '''
 
 import random
@@ -64,89 +60,83 @@ from sklearn.metrics import classification_report
 from collections import defaultdict
 
 
-def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
-    """
-    函数功能:
-    1. 接收当前折的训练与验证数据，搭建 PLE 多任务模型进行训练与评估
-    2. 记录每个 epoch 的各任务损失与准确率，绘制曲线并保存
-    3. 返回验证集上每个任务的真实标签、预测标签与正类概率，用于后续外部评价
-    参数:
-        x_train, y_train: 训练集特征与标签 (原始标签为 0/1，多任务列形式)
-        x_val, y_val: 验证集特征与标签
-        save_path: 当前实验的保存目录
-        fold_id: 交叉验证折号（用于文件命名）
-    返回:
-        y_true_fold, y_pred_fold, y_prod_fold: 验证集各任务真实标签 / 预测类别 / 预测概率
-    """
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report
+from collections import defaultdict
+
+
+def main(x_train, y_train, x_val, y_val, save_path, fold_id=None, num_shared_experts=1, num_task_experts=1):
     import os, time
-    # 确保模型保存主目录存在
+    # Create directory for saving model
     os.makedirs('saved_models', exist_ok=True)
 
-    # 设置随机种子，保证结果可复现
+    # Set random seed for reproducibility
     seed = 4
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
-    # 超参数设置
-    signal_length = 1008              # 原始信号长度（用于分离附加特征）
-    num_epochs = 100                  # 训练轮数
-    learning_Rate = 0.001             # 学习率
-    batch_size = 128                  # 批大小
+    # Model parameters
+    signal_length = 1008
+    features_length = 9
+    cnn_channels = 16
+    lstm_hidden_size = 32
+    lstm_num_layers = 1
+    output_size = 6
+    num_epochs = 100
+    learning_Rate = 0.001
+    batch_size = 128
 
-    num_classes = 3                   # 任务数
-    dict_classes = {0: '1_missing', 1: '2_trend', 2: '3_drift'}  # 任务索引与名称映射
+    num_classes = 3
+    dict_classes = {0: '1_missing', 1: '2_trend', 2: '3_drift'}
 
-    # 将 numpy 数据转为 tensor，并增加通道维度 (N,1,L)
+    # x_train, y_train = oversample_multitask(x_train, y_train, random_state=SEED)
+    # x_train, y_train, _, _ = oversample_by_label_combination_nonMissing(
+    #     x_train[:, :1008], y_train, method='SMOTE', random_state=42, k_neighbors=2)
+
     x_train = torch.tensor(x_train, dtype=torch.float32).unsqueeze(1)
     y_train = torch.tensor(y_train, dtype=torch.float32)
     x_val = torch.tensor(x_val, dtype=torch.float32).unsqueeze(1)
     y_val = torch.tensor(y_val, dtype=torch.float32)
 
-    # 将每列任务标签 (0/1) 转为 one-hot，两类任务 -> shape: (N, num_tasks, 2) 这里按列映射
     y_train = torch.eye(2)[y_train.long(), :]
     y_val = torch.eye(2)[y_val.long(), :]
 
-    # 计算额外特征数量 (切分信号后面的附加维度)
-    num_features = x_train[:,:,signal_length:].shape[-1]
+    num_features = x_train[:,:,1008:].shape[-1]
 
-    # 构建 MPAD-CGC 模型（多任务共享 + 私有专家结构）
-    # 这里的模型名称为PLE，是因为最初设计本模型时参考了 PLE 结构，所以沿用该命名（避免代码混乱）
-    model = PLE(inputs_dim=num_features,
-                labels_dict={
-                    '1_missing': 2, # 二分类任务
-                    '2_trend': 2, # 二分类任务
-                    '3_drift': 2, # 二分类任务
-                },
-                dnn_dropout=0.2, # Dropout 比例
-                num_shared_experts=9, # shared_experts数量
-                num_task_experts=6, # task_experts数量
-                expert_hidden_units=[128], # shared_experts最后一层隐藏层的单元数
-                tower_hidden_units=[128, 64, 32], # Task Tower's FCNN 隐藏层单元数列表
-                device='cuda')
+    model = PLE(
+        inputs_dim=num_features,
+        labels_dict={
+            '1_missing': 2,
+            '2_trend': 2,
+            '3_drift': 2,
+        },
+        dnn_dropout=0.2,
+        num_shared_experts=num_shared_experts,
+        num_task_experts=num_task_experts,
+        expert_hidden_units=[128],
+        tower_hidden_units=[128, 64, 32],
+        device='cuda'
+    )
 
-    # 设备选择与迁移
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    sum_parameters_by_layer(model)  # 打印各层参数统计（自定义函数）
+    sum_parameters_by_layer(model)
     print(f"Using device: {device}")
 
-    # 定义任务损失函数（批层面的 Focal Loss）
     criterion = BLFocalLoss(reduction='mean')
+    
 
-    # 不确定性学习的可训练 log_vars（每个任务一个）
     log_vars = nn.Parameter(torch.zeros(num_classes, requires_grad=True, device=device))
-    optimizer = optim.Adam(model.parameters(), lr=learning_Rate)          # 主优化器（模型参数）
-    optimizer_uncertainty = optim.Adam([log_vars], lr=1e-3)       # 不确定性参数优化器
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)  # 学习率调度
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer_uncertainty = optim.Adam([log_vars], lr=1e-3)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
 
-    # 构建数据集与数据加载器
     train_dataset = TensorDataset(x_train, y_train)
     test_dataset = TensorDataset(x_val, y_val)
     train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_data_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    # 记录训练过程指标（按任务与总损失）
     train_loss_values = []
     test_loss_values = []
     train_accuracy_values = []
@@ -154,65 +144,48 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
     train_loss_total = []
     test_loss_total = []
 
-    # 训练主循环
     for epoch in range(num_epochs):
         model.train()
-        # 每个 epoch 初始化记录容器
         epoch_train_loss_list = torch.zeros(num_classes).to(device)
         epoch_train_correct_list = torch.zeros(num_classes).to(device)
         epoch_train_loss_total = 0
         total_train = 0
 
-        # ----------- 前向与反向（训练阶段）-----------
         for inputs, labels in train_data_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-
             optimizer.zero_grad()
             optimizer_uncertainty.zero_grad()
 
-            outputs = model(inputs)                  # 多任务输出字典
-
-            # 计算每个任务损失（依次取对应输出与标签列）
-            loss_list = torch.stack([criterion(outputs[dict_classes[key]], labels[:, key], log_vars, key) 
-                                     for key in dict_classes])
-           
-            # 当前未对各任务加权（直接求和+L2正则）
+            sigma_sq = torch.exp(log_vars.detach())
+            outputs = model(inputs)
+            loss_list = torch.stack([criterion(outputs[dict_classes[key]], labels[:, key], log_vars, key) for key in dict_classes])
+            # weighted_losses = torch.exp(-log_vars) * loss_list
             weighted_losses = loss_list
             train_loss = weighted_losses.sum() + model.l2_reg_loss
 
-            # 反向传播与参数更新（含不确定性参数）
             train_loss.backward()
             optimizer.step()
             optimizer_uncertainty.step()
 
-            # 累积任务损失
             epoch_train_loss_list += loss_list
             epoch_train_loss_total += train_loss.item()
-
-            # 计算每任务预测正确数（取最大值类别）
             predicted_train_list = [torch.max(outputs[dict_classes[key]].data, 1) for key in dict_classes]
-            correct_train_list = [torch.sum(predicted_train_list[key][1] == torch.max(labels[:, key], 1)[1]) 
-                                  for key in dict_classes]
+            correct_train_list = [torch.sum(predicted_train_list[key][1] == torch.max(labels[:, key], 1)[1]) for key in dict_classes]
             epoch_train_correct_list += torch.tensor(correct_train_list).to(device)
             total_train += labels.size(0)
 
-        # 调度学习率
         scheduler.step()
 
-        # 计算平均损失与准确率（按任务）
         epoch_train_loss_list /= len(train_data_loader)
         epoch_train_loss_total /= len(train_data_loader)
-        epoch_train_accuracy_list = torch.stack([100 * epoch_train_correct_list[key] / total_train 
-                                                 for key in dict_classes])
+        epoch_train_accuracy_list = torch.stack([100 * epoch_train_correct_list[key] / total_train for key in dict_classes])
 
-        # ----------- 验证阶段（评估不反向）-----------
         model.eval()
         epoch_test_loss_list = torch.zeros(num_classes).to(device)
         epoch_test_correct_list = torch.zeros(num_classes).to(device)
         epoch_test_loss_total = 0
         total_test = 0
 
-        # 保存当前折验证集预测情况（后续主脚本使用）
         y_true_fold = {task: [] for task in dict_classes.values()}
         y_pred_fold = {task: [] for task in dict_classes.values()}
         y_prod_fold = {task: [] for task in dict_classes.values()}
@@ -221,16 +194,12 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
             for inputs, labels in test_data_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
-
-                # 验证集任务损失
-                loss_list = torch.stack([criterion(outputs[dict_classes[key]], labels[:, key], log_vars, key) 
-                                         for key in dict_classes])
+                loss_list = torch.stack([criterion(outputs[dict_classes[key]], labels[:, key], log_vars, key) for key in dict_classes])
                 weighted_losses = loss_list
                 test_loss = weighted_losses.sum() + model.l2_reg_loss
                 epoch_test_loss_list += loss_list
                 epoch_test_loss_total += test_loss.item()
 
-                # 收集各任务预测概率/类别/真实标签（概率取第二类 softmax 后值）
                 for key in dict_classes:
                     prods = torch.softmax(outputs[dict_classes[key]], dim=1)[:, 1].cpu().numpy()
                     preds = torch.argmax(outputs[dict_classes[key]], dim=1).cpu().numpy()
@@ -239,20 +208,15 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
                     y_pred_fold[dict_classes[key]].extend(preds)
                     y_true_fold[dict_classes[key]].extend(true)
 
-                # 统计分类正确数
                 predicted_test_list = [torch.max(outputs[dict_classes[key]].data, 1) for key in dict_classes]
-                correct_test_list = [torch.sum(predicted_test_list[key][1] == torch.max(labels[:, key], 1)[1]) 
-                                     for key in dict_classes]
+                correct_test_list = [torch.sum(predicted_test_list[key][1] == torch.max(labels[:, key], 1)[1]) for key in dict_classes]
                 epoch_test_correct_list += torch.tensor(correct_test_list).to(device)
                 total_test += labels.size(0)
 
-        # 验证集平均损失与准确率
         epoch_test_loss_list /= len(test_data_loader)
         epoch_test_loss_total /= len(test_data_loader)
-        epoch_test_accuracy_list = torch.stack([100 * epoch_test_correct_list[key] / total_test 
-                                                 for key in dict_classes])
+        epoch_test_accuracy_list = torch.stack([100 * epoch_test_correct_list[key] / total_test for key in dict_classes])
 
-        # 记录历史（用于绘图与 CSV）
         train_loss_values.append(epoch_train_loss_list.cpu().detach().numpy())
         test_loss_values.append(epoch_test_loss_list.cpu().detach().numpy())
         train_accuracy_values.append(epoch_train_accuracy_list.cpu().detach().numpy())
@@ -260,7 +224,6 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
         train_loss_total.append(epoch_train_loss_total)
         test_loss_total.append(epoch_test_loss_total)
 
-        # 每个 epoch 打印汇总信息
         if (epoch + 1) % 1 == 0:
             print(f'\nEpoch [{epoch + 1}/{num_epochs}]')
             print(f"Epoch [{epoch+1}/{num_epochs}], train Loss: {epoch_train_loss_total:.4f}, Log Vars: {log_vars.data.cpu().numpy()}")
@@ -271,23 +234,20 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
             for key in dict_classes:
                 print(f'Test_{dict_classes[key]}_Loss: {epoch_test_loss_list[key]:.4f}, Test_{dict_classes[key]}_Accuracy: {epoch_test_accuracy_list[key]:.2f}%')
 
-    # 保存当前折模型权重
     model_path = '{}/model_{}_fold_{}.pth'.format(save_path, time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime()),fold_id)
     torch.save(model.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 
-    # 绘制训练与验证曲线（按任务与总损失）
     plot_training_curves(train_loss_values, test_loss_values, train_accuracy_values, test_accuracy_values, dict_classes, save_path)
     plot_combined_task_curves(train_loss_values, test_loss_values, train_accuracy_values, test_accuracy_values, dict_classes, save_path)
     plot_total_loss_curve(train_loss_total, test_loss_total, save_path, fold_id)
 
-    # 将记录列表转为 ndarray 便于构建 DataFrame
-    train_loss_array = np.stack(train_loss_values)      # shape: (num_epochs, num_tasks)
-    test_loss_array = np.stack(test_loss_values)        # shape: (num_epochs, num_tasks)
+    train_loss_array = np.stack(train_loss_values)  # shape: (num_epochs, num_tasks)
+    test_loss_array = np.stack(test_loss_values)    # shape: (num_epochs, num_tasks)
     train_acc_array = np.stack(train_accuracy_values)
     test_acc_array = np.stack(test_accuracy_values)
 
-    # 构造损失指标 DataFrame
+
     loss_df = pd.DataFrame({
         'Epoch': np.arange(1, num_epochs + 1),
         'Train_total_loss': train_loss_total,
@@ -300,7 +260,6 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
         'Test_Drift_Loss': test_loss_array[:, 2],
     })
 
-    # 构造准确率指标 DataFrame
     acc_df = pd.DataFrame({
         'Epoch': np.arange(1, num_epochs + 1),
         'Train_Missing_Acc': train_acc_array[:, 0],
@@ -311,7 +270,7 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
         'Test_Drift_Acc': test_acc_array[:, 2],
     })
 
-    # 保存 CSV 文件（带折标识）
+    # Save to CSV (include fold_id if provided)
     fold_str = f"_fold{fold_id}" if fold_id is not None else ""
     csv_path = os.path.join(save_path, f"loss_values{fold_str}.csv")
     loss_df.to_csv(csv_path, index=False)
@@ -321,81 +280,93 @@ def main(x_train, y_train, x_val, y_val, save_path, fold_id=None):
     acc_df.to_csv(acc_csv_path, index=False)
     print(f"Accuracy values saved to {acc_csv_path}")
     
-    # 返回验证集各任务真实标签 / 预测标签 / 预测概率
     return y_true_fold, y_pred_fold, y_prod_fold
 
 
-if __name__ == '__main__':
-    # 生成模型保存目录（使用当前时间戳区分不同实验）
-    save_path = 'saved_models/PLE_mode_{}'.format(time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime()))
-    os.makedirs(save_path, exist_ok=True)
-    print(f"\nModel saved to {save_path}")
 
-    # 数据预处理：返回 x,y 等，其中此处只取全部样本与标签
-    # balanced=False 不做类平衡；normal_class=False 不单独指定正常类；method='test' 指定预处理模式
+if __name__ == '__main__':
     _, _, x_all, y_all, _ = data_preprocessing(balanced=False, platform='pytorch', normal_class=False, method='test')
-    
-    # 数据打乱（确保随机性）
+
+    # np.random.seed(8)
+    # indices = np.arange(x_all.shape[0])
+    # np.random.shuffle(indices)
+    # x_all = x_all[indices]
+    # y_all = y_all[indices]
+    # Shuffle the data
     np.random.seed(8)
     indices = np.arange(x_all.shape[0])
     np.random.shuffle(indices)
     x_all = x_all[indices]
     y_all = y_all[indices]
 
-    # 划分训练验证整体集合与测试集合（此处测试集后面未用到，只训练验证折）
-    x_train_val = x_all[:1436,:] # train+val共占比80%， 1436/1794=0.8
-    y_train_val = y_all[:1436,:] # 80%
-    x_test = x_all[1436:,:] # test占比20%
-    y_test = y_all[1436:,:] # 20%
+    x_train_val = x_all[:1436,:]
+    y_train_val = y_all[:1436,:]
+    x_test = x_all[1436:,:]
+    y_test = y_all[1436:,:]
 
-    # 使用第一个任务的标签作为分层依据（保证折划分类别均衡）
     stratify_labels = y_train_val[:, 0]
     skf = StratifiedKFold(n_splits=4, shuffle=False)
 
-    # 存储所有折的预测与真实标签（用于最终汇总）
-    all_y_true = defaultdict(list)
-    all_y_pred = defaultdict(list)
-    all_y_prod = defaultdict(list)
-    report_logs = []  # 保存各折分类报告的文本
+    # Grid search for num_shared_experts and num_task_experts
+    for num_shared_experts in range(1, 11): # 设置共享专家数量范围
+        for num_task_experts in range(1, 11): # 设置任务专家数量范围
+            config_name = f"Shared{num_shared_experts}_Task{num_task_experts}"
+            timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+            save_path = f'saved_models/para_configuration/PLE_{config_name}_{timestamp}'
+            os.makedirs(save_path, exist_ok=True)
+            print(f"\n--- Training with num_shared_experts={num_shared_experts}, num_task_experts={num_task_experts} ---")
+            print(f"Model saved to {save_path}")
 
-    # 交叉验证循环（这里只训练第4折，其他折直接跳过）
-    for fold, (train_idx, val_idx) in enumerate(skf.split(x_train_val, stratify_labels), 1):
-        if fold == 4:
-            print(f"\n=== Fold {fold} ===")
-            # 当前折的训练与验证数据
-            x_train_fold = x_train_val[train_idx]
-            y_train_fold = y_train_val[train_idx]
-            x_val_fold = x_train_val[val_idx]
-            y_val_fold = y_train_val[val_idx]
+            all_y_true = defaultdict(list)
+            all_y_pred = defaultdict(list)
+            all_y_prod = defaultdict(list)
+            report_logs = []
 
-            # 训练当前折模型并返回该折的预测结果（真实标签、类别预测、概率预测）
-            y_true_dict, y_pred_dict, y_prod_dict = main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, save_path, fold_id=fold)
+            for fold, (train_idx, val_idx) in enumerate(skf.split(x_train_val, stratify_labels), 1):
+                if fold == 4:
+                    print(f"\n=== Fold {fold} ===")
+                    x_train_fold = x_train_val[train_idx]
+                    y_train_fold = y_train_val[train_idx]
+                    x_val_fold = x_train_val[val_idx]
+                    y_val_fold = y_train_val[val_idx]
 
-            # 记录本折的分类报告与 AUC
-            report_logs.append(f"\n=== Classification Report: Fold {fold} ===")
+                    # Train and evaluate
+                    y_true_dict, y_pred_dict, y_prod_dict = main(
+                        x_train_fold, y_train_fold,
+                        x_val_fold, y_val_fold,
+                        save_path, fold_id=fold,
+                        num_shared_experts=num_shared_experts,
+                        num_task_experts=num_task_experts
+                    )
+
+                    # Optionally save or aggregate results here
+
+                    report_logs.append(f"\n=== Classification Report: Fold {fold} ===")
+                    for task in ['1_missing', '2_trend', '3_drift']:
+                        report = classification_report(
+                            y_true_dict[task], y_pred_dict[task], target_names=['0', '1'], digits=4
+                        )
+                        auc = roc_auc_score(y_true_dict[task], y_prod_dict[task])
+                        report_logs.append(f"\nTask: {task}\n{report}\nROC AUC: {auc:.4f}\n")
+                        print(f"\nTask: {task}\n{report}\nROC AUC: {auc:.4f}\n")
+                        # report_logs.append(f"\nTask: {task}\n{report}")
+
+                        all_y_true[task].extend(y_true_dict[task])
+                        all_y_pred[task].extend(y_pred_dict[task])
+                        all_y_prod[task].extend(y_prod_dict[task])
+                else:
+                    continue
+            # Final average report
+            report_logs.append("\n=== Final Average Classification Report (All Folds) ===")
             for task in ['1_missing', '2_trend', '3_drift']:
-                report = classification_report(
-                    y_true_dict[task], y_pred_dict[task], target_names=['0', '1'], digits=4
-                )
-                auc = roc_auc_score(y_true_dict[task], y_prod_dict[task])
-                report_logs.append(f"\nTask: {task}\n{report}\nROC AUC: {auc:.4f}\n")
-                print(f"\nTask: {task}\n{report}\nROC AUC: {auc:.4f}\n")
+                report = classification_report(all_y_true[task], all_y_pred[task], target_names=['0', '1'], digits=4)
+                auc = roc_auc_score(all_y_true[task], all_y_prod[task])
+                report_logs.append(f"\nAverage Classification Report for Task: {task}\n{report}\nROC AUC: {auc}\n")
+                print(f"\nAverage Classification Report for Task: {task}\n{report}\nROC AUC: {auc:.4f}\n")
+                # report_logs.append(f"\nAverage Classification Report for Task: {task}\n{report}")
+                # print(f"\nAverage Classification Report for Task: {task}")
+                # print(report)
 
-                # 汇总到全局（用于最终平均报告）
-                all_y_true[task].extend(y_true_dict[task])
-                all_y_pred[task].extend(y_pred_dict[task])
-                all_y_prod[task].extend(y_prod_dict[task])
-        else:
-            continue
-
-    # 计算（已执行折的）汇总平均分类报告与 AUC（此处只有第4折数据）
-    report_logs.append("\n=== Final Average Classification Report (All Folds) ===")
-    for task in ['1_missing', '2_trend', '3_drift']:
-        report = classification_report(all_y_true[task], all_y_pred[task], target_names=['0', '1'], digits=4)
-        auc = roc_auc_score(all_y_true[task], all_y_prod[task])
-        report_logs.append(f"\nAverage Classification Report for Task: {task}\n{report}\nROC AUC: {auc}\n")
-        print(f"\nAverage Classification Report for Task: {task}\n{report}\nROC AUC: {auc:.4f}\n")
-
-    # 保存所有折的分类报告到文本文件
-    with open(save_path+"/classification_reports.txt", "w") as f:
-        f.write("\n".join(report_logs))
+            # Save all reports to a text file
+            with open(save_path+"/classification_reports.txt", "w") as f:
+                f.write("\n".join(report_logs))

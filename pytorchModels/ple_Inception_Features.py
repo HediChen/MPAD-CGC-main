@@ -77,8 +77,8 @@ class InceptionBlock(nn.Module):
 
         out = torch.cat([x1, x2, x3, x4], dim=1)  # (B, out_channels * 4, T)
         out = self.bn(out)
-        metric = out.detach().cpu().numpy()
-        plot_metric_heatmap_and_signals(metric, save_dir="discussion/figures/metric_vis")
+        # metric = out.detach().cpu().numpy()
+        # plot_metric_heatmap_and_signals(metric, save_dir="discussion/figures/metric_vis")
         return self.relu(out)
 
 class ChannelAttention1D(nn.Module):

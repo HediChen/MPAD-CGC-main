@@ -1,3 +1,11 @@
+'''
+这是用于加载和分析多任务MPAD-CGC模型不同专家配置（共享专家和任务专家数量）分类性能的脚本。
+当跑完train_MPAD_CGC_autoTrain.py脚本后，会在指定目录下生成多个配置文件夹，
+每个文件夹包含该配置下的分类报告。
+该脚本会遍历这些配置文件夹，提取每个配置在各折交叉验证中的分类性能指标（准确率和ROC AUC），
+并进行排名和可视化分析，帮助选择最佳的专家配置组合。
+'''
+
 import sys
 sys.path.append('./')
 import os
@@ -432,6 +440,7 @@ def rank_best_fold_by_joint_score(metrics_data, csv_path='best_folds_by_joint_sc
 
 def rank_configs_by_fold(metrics_data, fold_id=1, save_dir='fold_ranking_outputs'):
     """
+    这里对应的是论文中的2.2. Expert configuration optimization strategy
     Rank all (shared, task) configs for a specified fold by:
       - avg_accuracy
       - avg_roc_auc
