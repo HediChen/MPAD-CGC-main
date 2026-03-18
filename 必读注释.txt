@@ -1,0 +1,34 @@
+这是MPAD-CGC的脚本说明。
+
+1. 训练
+    1.1 train_MPAD_CGC.py是训练脚本，需要指定其中的模型超参数，包括模型的共享专家和任务专家数量等超参数。
+    1.2 train_MPAD_CGC_autoTrain.py是自动训练脚本，会自动根据指定的共享专家和任务专家数量范围自动排列组合进行训练.
+        通过结合./tools/para_config.py脚本，可以自动搜索最优专家配置。
+
+2. 测试
+    2.1 test_MPAD_CGC.py是测试脚本，需要指定模型路径和测试数据集路径。
+        注意：必须保证测试使用的超参数与训练时保持一致（特别注意num_shared_experts和num_task_experts），否则会报错！！！。
+
+3. 数据预处理
+    3.1 preprocessing_addFeatures.py是数据预处理脚本，用于将原始数据集转换为模型输入格式。
+        包含数据加载、特征提取、归一化和划分训练验证集等功能。
+        论文中的统计特征提取在此脚本完成，提取的特征与原始信号拼接，一起作为MPAD-CGC的输入。
+    3.2 ./unit/feature_extractor.py是文中9个统计特征提取脚本。
+
+4. MPAD-CGC模型
+    4.1 ./pytorchModels/ple_Inception_Features_analysis_train.py是MPAD-CGC模型的实现。
+    包含多尺度Inception模块、局部时间注意力机制、
+    任务特定专家和Gate网络等组件。该模型设计用于多任务时间序列异常检测，
+    能够有效捕捉不同时间尺度的异常模式，并通过任务特定的专家网络和Gate机制实现共享与专属特征的融合。
+
+5. 其他对比模型
+    以下对比模型主要用于代码保存。若要使用以下模型，只需要将训练脚本的模型替换为以下模型即可
+    5.1 ./pytorchModels/hardShare_Inception.py是文中Model A：Hard Parameter Sharing模型的实现。
+    5.2 ./pytorchModels/moe_Inception.py是文中Model B: MoE模型的实现。
+    5.3 ./pytorchModels/mmoe_Inception.py是文中Model C：MMoE模型的实现
+    5.4 ./pytorchModels/cgc_Inception.py是文中Model D: CGC模型的实现。
+    5.5 ./pytorchModels/cgc_dnn.py是文中Model E：CGC with DNN experts模型的实现。
+    5.6 ./pytorchModels.cgc_cnn.py是文中Model F: CGC with CNN experts模型的实现。
+
+6. 其他工具
+    文件夹tools存放了论文结果分析的图表绘制脚本，这部分的介绍在各FIGURE文件夹有更详细的说明。
