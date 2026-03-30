@@ -766,8 +766,11 @@ def plot_training_history(history):
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
+    axes[1].plot(history['train_accuracy'], label='Train Accuracy', linewidth=2)
+    # axes[1].plot(history['train_f1'], label='Train F1-Score', linewidth=2)
     axes[1].plot(history['val_accuracy'], label='Val Accuracy', linewidth=2)
-    axes[1].plot(history['val_f1'], label='Val F1-Score', linewidth=2)
+    # axes[1].plot(history['val_f1'], label='Val F1-Score', linewidth=2)
+
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Score')
     axes[1].set_title('DenseNet+Transformer - Training History - Accuracy & F1-Score')
@@ -885,7 +888,7 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
         num_dense_blocks=3,
         d_model=256,
         num_heads=8,
-        num_transformer_layers=4,
+        num_transformer_layers=1,
         ff_dim=1024,
         dropout_rate=0.3
     )
@@ -909,6 +912,7 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     print("\n[STEP 6] Training Model with Label Smoothing and Focal Loss...")
     print("="*70)
     
+    print(f"Training with Label Smoothing: {use_label_smoothing}")
     trainer = ModelTrainer(model, device, class_weights=class_weights,
                           use_label_smoothing=use_label_smoothing)
     
@@ -916,7 +920,9 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
         'train_loss': [],
         'val_loss': [],
         'val_accuracy': [],
-        'val_f1': []
+        'val_f1': [],
+        'train_accuracy': [],
+        'train_f1': []
     }
     
     best_val_f1 = 0.0
@@ -928,15 +934,19 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
         train_loss = trainer.train_epoch(train_loader, use_focal_loss=False)
         
         # Validate
+        train_loss, train_acc, train_f1, _, _ = trainer.validate(train_loader)
         val_loss, val_acc, val_f1, _, _ = trainer.validate(val_loader)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['val_accuracy'].append(val_acc)
         history['val_f1'].append(val_f1)
+        history['train_accuracy'].append(train_acc)
+        history['train_f1'].append(train_f1)
         
         # Learning rate scheduling
-        trainer.scheduler.step()
+        # trainer.scheduler.step()
+        trainer.scheduler.step(val_f1)
         
         # Early stopping
         if val_f1 > best_val_f1:
@@ -961,8 +971,8 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     
     # ============== STEP 7: TESTING ==============
     print("\n[STEP 7] Testing Model...")
-    
-    model.load_state_dict(torch.load('best_densenet_transformer_model.pth'))
+    torch.save(model.state_dict(), 'last_densenet_transformer_model.pth')
+    model.load_state_dict(torch.load('last_densenet_transformer_model.pth'))
     
     y_pred_stl, y_true_stl_test, y_probs = trainer.test(test_loader)
     
@@ -993,6 +1003,7 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     print("  - best_densenet_transformer_model.pth: Trained model weights")
     print("  - densenet_transformer_training_history.png: Training curves")
     print("  - densenet+transformer_confusion_matrix.png: Confusion matrix")
+    print("  - last_densenet_transformer_model.pth: Last trained model weights")
     print("="*80 + "\n")
     
     return model, history, mtl_results, y_pred_stl, y_true_stl_test
@@ -1076,7 +1087,7 @@ if __name__ == "__main__":
                 y_val_fold=y_val_fold,
                 x_test=x_test[:, :1008],
                 y_test=y_test,
-                num_epochs=1000,
+                num_epochs=300,
                 batch_size=128
             )
         else:

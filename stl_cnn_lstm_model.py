@@ -436,16 +436,15 @@ class ModelTrainer:
     def __init__(self, model, device, class_weights=None):
         self.model = model
         self.device = device
-        self.class_weights = class_weights
+        self.class_weights = class_weights.to(device)
         
         # Define loss functions
-        self.criterion_weighted_ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.criterion_weighted_ce = nn.CrossEntropyLoss(weight=self.class_weights)
         self.criterion_focal = FocalLoss(gamma=2.0, alpha=class_weights, weight=None)
         
         self.optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=10
-        )
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1)  # 学习率调度
+    
     
     def train_epoch(self, train_loader, use_focal_loss=True):
         """Train for one epoch"""
@@ -678,8 +677,10 @@ def plot_training_history(history):
     axes[0].grid(True, alpha=0.3)
     
     # Accuracy
+    axes[1].plot(history['train_accuracy'], label='Train Accuracy', linewidth=2)
+    # axes[1].plot(history['train_f1'], label='Train F1-Score', linewidth=2)
     axes[1].plot(history['val_accuracy'], label='Val Accuracy', linewidth=2)
-    axes[1].plot(history['val_f1'], label='Val F1-Score', linewidth=2)
+    # axes[1].plot(history['val_f1'], label='Val F1-Score', linewidth=2)
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Score')
     axes[1].set_title('Training History - Accuracy & F1-Score')
@@ -822,7 +823,9 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
         'train_loss': [],
         'val_loss': [],
         'val_accuracy': [],
-        'val_f1': []
+        'val_f1': [],
+        'train_accuracy': [],
+        'train_f1': []
     }
     
     best_val_f1 = 0.0
@@ -832,15 +835,18 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     
     for epoch in range(num_epochs):
         # Train
-        train_loss = trainer.train_epoch(train_loader, use_focal_loss=True)
+        train_loss = trainer.train_epoch(train_loader, use_focal_loss=False)
         
         # Validate
+        train_loss, train_acc, train_f1, _, _ = trainer.validate(train_loader)
         val_loss, val_acc, val_f1, _, _ = trainer.validate(val_loader)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['val_accuracy'].append(val_acc)
         history['val_f1'].append(val_f1)
+        history['train_accuracy'].append(train_acc)
+        history['train_f1'].append(train_f1)
         
         # Learning rate scheduling
         trainer.scheduler.step(val_f1)
@@ -870,7 +876,8 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     print("\n[STEP 7] Testing Model...")
     
     # Load best model
-    model.load_state_dict(torch.load('best_model_CNNLSTM.pth'))
+    torch.save(model.state_dict(), 'last_model_CNNLSTM.pth')
+    model.load_state_dict(torch.load('last_model_CNNLSTM.pth'))
     
     y_pred_stl, y_true_stl_test, y_probs = trainer.test(test_loader)
     
@@ -900,7 +907,8 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     print("TRAINING COMPLETED SUCCESSFULLY!")
     print("="*80)
     print("\nGenerated files:")
-    print("  - best_model.pth: Trained model weights")
+    print("  - best_model_CNNLSTM.pth: Trained model weights")
+    print("  - last_model_CNNLSTM.pth: Last trained model weights")
     print("  - training_history.png: Training curves")
     print("  - stl_confusion_matrix.png: Confusion matrix visualization")
     print("="*80 + "\n")
@@ -986,7 +994,7 @@ if __name__ == "__main__":
                 y_val_fold=y_val_fold,
                 x_test=x_test[:, :1008],
                 y_test=y_test,
-                num_epochs=500,
+                num_epochs=300,
                 batch_size=128
             )
             print(f"✓ Fold {fold} training and evaluation completed!")
