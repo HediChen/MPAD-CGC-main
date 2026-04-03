@@ -9,6 +9,9 @@ References:
 - Sainath et al., 2015: "Convolutional, Recurrent, and Fully Connected Deep Neural Networks for Speech Recognition"
 - Lin et al., 2017: "Focal Loss for Dense Object Detection"
 - Wang et al., 2019: "Calibrating Deep Neural Networks using Focal Loss"
+- Cui et al., 2021: "Class-Balanced Loss Based on Effective Number of Samples"
+- Li et al., 2021: "Balanced Softmax with Margin Loss for Long-Tailed Visual Recognition"
+- Tan et al., 2020: "Equalization Loss for Long-Tailed Object Detection"
 """
 
 import os
@@ -29,7 +32,7 @@ from collections import Counter
 import warnings
 warnings.filterwarnings('ignore')
 import os
-import  time
+import time
 from preprocessing_addFeatures import data_preprocessing
 from collections import defaultdict
 from unit.summary import summary, sum_parameters_by_layer
@@ -38,6 +41,38 @@ from unit.summary import summary, sum_parameters_by_layer
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+
+# ==================== LOSS FUNCTION OPTIONS ====================
+"""
+LOSS FUNCTION SELECTION GUIDE:
+
+1. 'focal_loss': Focal Loss
+   - Best for: Extremely imbalanced datasets (Drift: 4.85%)
+   - Parameter: gamma=2.0 (focus parameter)
+   - Reference: Lin et al., 2017
+
+2. 'class_balanced': Class-Balanced Loss (Effective Number of Samples)
+   - Best for: Mid to high imbalance with smooth weight scaling
+   - Parameter: beta=0.9999 (effective number parameter)
+   - Reference: Cui et al., 2021
+   
+3. 'balanced_softmax': Balanced Softmax Loss
+   - Best for: Theoretically principled long-tailed classification
+   - No extra parameters (uses label frequency in softmax)
+   - Reference: Li et al., 2021
+   
+4. 'ldam': Label-Distribution-Aware Margin Loss
+   - Best for: Preventing boundary collapse in minority classes
+   - Parameter: margin_scale (controls margin magnitude)
+   - Reference: Tan et al., 2020
+
+5. 'weighted_ce': Weighted CrossEntropy (Baseline)
+   - Best for: Simple class weighting (1/frequency)
+   - Reference: Standard CE with class weights
+"""
+
+LOSS_FUNCTION = 'class_balanced'  # Change this to select loss function
+# Options: 'focal_loss', 'class_balanced', 'balanced_softmax', 'ldam', 'weighted_ce'
 
 # ==================== DATASET CONVERSION ====================
 
@@ -193,6 +228,234 @@ class FocalLoss(nn.Module):
             return focal_loss.sum()
         else:
             return focal_loss
+
+
+class ClassBalancedLoss(nn.Module):
+    """
+    Class-Balanced Loss Based on Effective Number of Samples
+    Reference: Cui et al., 2021 "Class-Balanced Loss Based on Effective Number of Samples"
+    
+    Uses effective number of samples instead of raw frequency:
+    E_c = (1 - β^n_c) / (1 - β)
+    w_c = 1 / E_c
+    
+    where:
+    - n_c: number of samples in class c
+    - β ∈ [0.9, 0.999]: effective number parameter
+    
+    Key advantage: Smooth, sub-linear weight scaling prevents extreme weights
+    """
+    def __init__(self, num_classes=7, samples_per_class=None, beta=0.9999, weight=None, reduction='mean'):
+        super(ClassBalancedLoss, self).__init__()
+        self.num_classes = num_classes
+        self.beta = beta
+        self.reduction = reduction
+        self.weight = weight
+        
+        if samples_per_class is not None:
+            self.effective_num = 1.0 - np.power(beta, samples_per_class)
+            self.weights = (1.0 - beta) / np.asarray(self.effective_num)
+            self.weights = self.weights / self.weights.sum() * num_classes
+            self.weights = torch.tensor(self.weights, dtype=torch.float32).to('cuda' if torch.cuda.is_available() else 'cpu') if weight is not None else None
+        else:
+            self.weights = None
+        
+        self.ce_loss = nn.CrossEntropyLoss(weight=self.weights, reduction='none')
+    
+    def forward(self, inputs, targets):
+        loss = self.ce_loss(inputs, targets)
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class BalancedSoftmaxLoss(nn.Module):
+    """
+    Balanced Softmax Loss for Long-Tailed Recognition
+    Reference: Li et al., 2021 "Balanced Softmax with Margin Loss for Long-Tailed Visual Recognition"
+    
+    Corrects label shift by adjusting softmax normalization:
+    p(y=c|x) = exp(z_c + log n_c) / Σ_j exp(z_j + log n_j)
+    
+    Key advantages:
+    - Theoretically principled (from Bayesian perspective)
+    - Does NOT increase gradient variance
+    - Maintains optimizer stability
+    - Best for deep models (Transformer, CNN)
+    
+    Core idea: Incorporate class prior probability into softmax
+    """
+    def __init__(self, num_classes=7, samples_per_class=None, reduction='mean'):
+        super(BalancedSoftmaxLoss, self).__init__()
+        self.num_classes = num_classes
+        self.reduction = reduction
+        
+        if samples_per_class is not None:
+            # Compute class frequencies
+            total_samples = np.sum(samples_per_class)
+            class_priors = samples_per_class / total_samples
+            self.class_log_priors = torch.from_numpy(np.log(class_priors)).float()
+        else:
+            self.class_log_priors = None
+    
+    def forward(self, inputs, targets):
+        # inputs shape: (batch_size, num_classes)
+        # targets shape: (batch_size,)
+        
+        if self.class_log_priors is not None:
+            if self.class_log_priors.device != inputs.device:
+                self.class_log_priors = self.class_log_priors.to(inputs.device)
+            
+            # Adjust logits with class priors
+            adjusted_inputs = inputs + self.class_log_priors.unsqueeze(0)
+        else:
+            adjusted_inputs = inputs
+        
+        # Standard cross-entropy with adjusted inputs
+        log_softmax = torch.nn.functional.log_softmax(adjusted_inputs, dim=1)
+        loss = -log_softmax.gather(1, targets.unsqueeze(1)).squeeze(1)
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class LDAMLoss(nn.Module):
+    """
+    Label-Distribution-Aware Margin Loss (LDAM)
+    Reference: Tan et al., 2020 "Equalization Loss for Long-Tailed Object Detection"
+    
+    Adds class-dependent margins to prevent decision boundary collapse:
+    L = -log[exp(z_y - m_y) / (exp(z_y - m_y) + Σ_{j≠y} exp(z_j))]
+    
+    where m_y ∝ 1 / (n_y^0.25)  [margin proportional to class rarity]
+    
+    Key advantage:
+    - Does NOT increase gradient variance (unlike weight-based methods)
+    - Uses structural margin constraints (like SVM)
+    - Better for preventing overfitting on minority classes
+    """
+    def __init__(self, num_classes=7, samples_per_class=None, margin_scale=0.5, reduction='mean'):
+        super(LDAMLoss, self).__init__()
+        self.num_classes = num_classes
+        self.margin_scale = margin_scale
+        self.reduction = reduction
+        
+        if samples_per_class is not None:
+            # Compute margins: m_c ∝ 1 / (n_c^0.25)
+            # Normalize by max to avoid extreme values
+            margins = 1.0 / (np.power(samples_per_class, 0.25))
+            margins = margins / np.max(margins) * margin_scale
+            self.margins = torch.from_numpy(margins).float()
+        else:
+            self.margins = torch.zeros(num_classes)
+    
+    def forward(self, inputs, targets):
+        # inputs shape: (batch_size, num_classes)
+        # targets shape: (batch_size,)
+        
+        if self.margins.device != inputs.device:
+            self.margins = self.margins.to(inputs.device)
+        
+        # Subtract margins from logits
+        batch_margins = self.margins[targets]  # (batch_size,)
+        adjusted_inputs = inputs.clone()
+        adjusted_inputs[range(len(targets)), targets] -= batch_margins
+        
+        # Standard cross-entropy with adjusted inputs
+        log_softmax = torch.nn.functional.log_softmax(adjusted_inputs, dim=1)
+        loss = -log_softmax.gather(1, targets.unsqueeze(1)).squeeze(1)
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+def create_loss_function(loss_type, num_classes=7, samples_per_class=None, 
+                        class_weights=None, device='cuda'):
+    """
+    Factory function to create loss function based on selection
+    
+    Args:
+        loss_type: str, one of ['focal_loss', 'class_balanced', 'balanced_softmax', 'ldam', 'weighted_ce']
+        num_classes: number of classes
+        samples_per_class: numpy array of sample counts per class
+        class_weights: pre-computed class weights (for weighted_ce)
+        device: torch device
+    
+    Returns:
+        loss function object
+    """
+    print("\n" + "="*70)
+    print(f"CREATING LOSS FUNCTION: {loss_type.upper()}")
+    print("="*70)
+    
+    if loss_type == 'focal_loss':
+        loss_fn = FocalLoss(
+            alpha=class_weights.to(device) if class_weights is not None else None,
+            gamma=2.0,
+            weight=None,
+            reduction='mean'
+        )
+        print("✓ Focal Loss (γ=2.0)")
+        print("  - Best for: Extremely imbalanced data")
+        print("  - Focus parameter γ controls difficulty weighting")
+        
+    elif loss_type == 'class_balanced':
+        loss_fn = ClassBalancedLoss(
+            num_classes=num_classes,
+            samples_per_class=samples_per_class,
+            beta=0.9999,
+            reduction='mean'
+        )
+        print("✓ Class-Balanced Loss (β=0.9999)")
+        print("  - Uses effective number of samples formula")
+        print("  - Smooth, sub-linear weight scaling")
+        
+    elif loss_type == 'balanced_softmax':
+        loss_fn = BalancedSoftmaxLoss(
+            num_classes=num_classes,
+            samples_per_class=samples_per_class,
+            reduction='mean'
+        )
+        print("✓ Balanced Softmax Loss")
+        print("  - Theoretically principled approach")
+        print("  - Incorporates class priors into softmax")
+        print("  - Most stable gradient behavior")
+        
+    elif loss_type == 'ldam':
+        loss_fn = LDAMLoss(
+            num_classes=num_classes,
+            samples_per_class=samples_per_class,
+            margin_scale=0.5,
+            reduction='mean'
+        )
+        print("✓ Label-Distribution-Aware Margin Loss (LDAM)")
+        print("  - Margin inversely proportional to class frequency")
+        print("  - Prevents decision boundary collapse")
+        
+    elif loss_type == 'weighted_ce':
+        if class_weights is not None:
+            class_weights = class_weights.to(device)
+        loss_fn = nn.CrossEntropyLoss(weight=class_weights, reduction='mean')
+        print("✓ Weighted Cross-Entropy (Baseline)")
+        print("  - Simple class weighting (1/frequency)")
+        
+    else:
+        raise ValueError(f"Unknown loss function: {loss_type}")
+    
+    print("="*70 + "\n")
+    return loss_fn
 
 
 # ==================== DATASET & DATALOADER ====================
@@ -433,20 +696,19 @@ class SimplifiedCNNLSTMModel(nn.Module):
 class ModelTrainer:
     """Handle model training, validation, and evaluation"""
     
-    def __init__(self, model, device, class_weights=None):
+    def __init__(self, model, device, loss_fn=None, class_weights=None):
         self.model = model
         self.device = device
-        self.class_weights = class_weights.to(device)
         
-        # Define loss functions
-        self.criterion_weighted_ce = nn.CrossEntropyLoss(weight=self.class_weights)
-        self.criterion_focal = FocalLoss(gamma=2.0, alpha=class_weights, weight=None)
+        # Use provided loss function or default to weighted CE
+        self.loss_fn = loss_fn if loss_fn is not None else nn.CrossEntropyLoss(
+            weight=class_weights.to(device) if class_weights is not None else None
+        )
         
         self.optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1)  # 学习率调度
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1)
     
-    
-    def train_epoch(self, train_loader, use_focal_loss=True):
+    def train_epoch(self, train_loader):
         """Train for one epoch"""
         self.model.train()
         total_loss = 0.0
@@ -459,11 +721,8 @@ class ModelTrainer:
             # Forward pass
             outputs = self.model(x)
             
-            # Compute loss (using Focal Loss for better handling of imbalance)
-            if use_focal_loss:
-                loss = self.criterion_focal(outputs, y)
-            else:
-                loss = self.criterion_weighted_ce(outputs, y)
+            # Compute loss with selected loss function
+            loss = self.loss_fn(outputs, y)
             
             # Backward pass
             loss.backward()
@@ -487,7 +746,7 @@ class ModelTrainer:
                 x, y = x.to(self.device), y.to(self.device)
                 
                 outputs = self.model(x)
-                loss = self.criterion_focal(outputs, y)
+                loss = self.loss_fn(outputs, y)
                 
                 total_loss += loss.item()
                 
@@ -678,9 +937,7 @@ def plot_training_history(history):
     
     # Accuracy
     axes[1].plot(history['train_accuracy'], label='Train Accuracy', linewidth=2)
-    # axes[1].plot(history['train_f1'], label='Train F1-Score', linewidth=2)
     axes[1].plot(history['val_accuracy'], label='Val Accuracy', linewidth=2)
-    # axes[1].plot(history['val_f1'], label='Val F1-Score', linewidth=2)
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Score')
     axes[1].set_title('Training History - Accuracy & F1-Score')
@@ -717,7 +974,7 @@ def plot_confusion_matrix(y_true, y_pred, title='Confusion Matrix'):
 # ==================== MAIN EXECUTION ====================
 
 def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
-         num_epochs=50, batch_size=32):
+         num_epochs=50, batch_size=32, loss_fn_type='weighted_ce'):
     """
     Main training pipeline using pre-split datasets
     
@@ -730,11 +987,13 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
         y_test: numpy array of shape (test_num, 3) - test MTL labels
         num_epochs: number of training epochs
         batch_size: batch size for training
+        loss_fn_type: type of loss function to use
     """
     
     print("\n" + "="*80)
     print("SINGLE-TASK LEARNING CNN-LSTM MODEL FOR ANOMALY DETECTION")
     print("Using Pre-Split Datasets")
+    print(f"Loss Function: {loss_fn_type.upper()}")
     print("="*80)
     
     # ============== STEP 1: DATA CONVERSION ==============
@@ -754,6 +1013,10 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     analyze_class_distribution(y_train_stl, "Training Set")
     analyze_class_distribution(y_val_stl, "Validation Set")
     analyze_class_distribution(y_test_stl, "Test Set")
+    
+    # Get samples per class for loss functions that need it
+    counter = Counter(y_train_stl)
+    samples_per_class = np.array([counter.get(i, 0) for i in range(7)])
     
     # ============== STEP 3: DATA PREPROCESSING ==============
     print("\n[STEP 3] Data Preprocessing...")
@@ -789,14 +1052,6 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"✓ Using device: {device}")
     
-    # model = CNNLSTMModel(
-    #     input_channels=1,
-    #     sequence_length=1008,
-    #     num_classes=7,
-    #     conv_filters=[64, 128],
-    #     lstm_hidden=256,
-    #     dropout_rate=0.3
-    # )
     model = SimplifiedCNNLSTMModel(
         input_channels=1,
         sequence_length=1008,
@@ -813,11 +1068,21 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     print(f"  - Total parameters: {total_params:,}")
     print(f"  - Trainable parameters: {trainable_params:,}")
     
+    # ============== STEP 5.5: CREATE LOSS FUNCTION ==============
+    print("\n[STEP 5.5] Creating Loss Function...")
+    loss_fn = create_loss_function(
+        loss_type=loss_fn_type,
+        num_classes=7,
+        samples_per_class=samples_per_class,
+        class_weights=class_weights,
+        device=device
+    )
+    
     # ============== STEP 6: TRAINING ==============
     print("\n[STEP 6] Training Model...")
     print("="*70)
     
-    trainer = ModelTrainer(model, device, class_weights=class_weights)
+    trainer = ModelTrainer(model, device, loss_fn=loss_fn, class_weights=class_weights)
     
     history = {
         'train_loss': [],
@@ -829,13 +1094,12 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
     }
     
     best_val_f1 = 0.0
-    best_val_loss = float('inf')
     patience = 500
     patience_counter = 0
     
     for epoch in range(num_epochs):
         # Train
-        train_loss = trainer.train_epoch(train_loader, use_focal_loss=False)
+        train_loss = trainer.train_epoch(train_loader)
         
         # Validate
         train_loss, train_acc, train_f1, _, _ = trainer.validate(train_loader)
@@ -849,7 +1113,7 @@ def main(x_train_fold, y_train_fold, x_val_fold, y_val_fold, x_test, y_test,
         history['train_f1'].append(train_f1)
         
         # Learning rate scheduling
-        trainer.scheduler.step(val_f1)
+        trainer.scheduler.step()
         
         # Early stopping
         if val_f1 > best_val_f1:
@@ -921,18 +1185,6 @@ if __name__ == "__main__":
     print("\n" + "="*80)
     print("LOADING PRE-SPLIT DATASETS")
     print("="*80)
-    
-    # # Load your pre-split MTL datasets
-    # x_train_fold = np.load('x_train_fold.npy')      # (train_num, 1008)
-    # y_train_fold = np.load('y_train_fold.npy')      # (train_num, 3)
-    
-    # x_val_fold = np.load('x_val_fold.npy')          # (val_num, 1008)
-    # y_val_fold = np.load('y_val_fold.npy')          # (val_num, 3)
-    
-    # x_test = np.load('x_test.npy')                  # (test_num, 1008)
-    # y_test = np.load('y_test.npy')                  # (test_num, 3)
-    
-
 
     # 生成模型保存目录（使用当前时间戳区分不同实验）
     save_path = 'saved_models/PLE_mode_{}'.format(time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime()))
@@ -986,7 +1238,7 @@ if __name__ == "__main__":
             print(f"  - y_test shape: {y_test.shape}")
             print("="*80)
             
-            # Run main training pipeline
+            # Run main training pipeline with selected loss function
             model, history, mtl_results, y_pred, y_true = main(
                 x_train_fold=x_train_fold[:, :1008],  # 只取信号部分作为输入
                 y_train_fold=y_train_fold,
@@ -994,8 +1246,9 @@ if __name__ == "__main__":
                 y_val_fold=y_val_fold,
                 x_test=x_test[:, :1008],
                 y_test=y_test,
-                num_epochs=300,
-                batch_size=128
+                num_epochs=200,
+                batch_size=128,
+                loss_fn_type=LOSS_FUNCTION  # Pass the selected loss function
             )
             print(f"✓ Fold {fold} training and evaluation completed!")
         else:

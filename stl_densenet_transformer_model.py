@@ -1087,7 +1087,7 @@ if __name__ == "__main__":
                 y_val_fold=y_val_fold,
                 x_test=x_test[:, :1008],
                 y_test=y_test,
-                num_epochs=300,
+                num_epochs=200,
                 batch_size=128
             )
         else:
